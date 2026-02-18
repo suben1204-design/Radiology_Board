@@ -1,0 +1,808 @@
+<!DOCTYPE html>
+<html lang="zh-TW">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>醫學影像科 - 智慧型緊急災害編組電子看板</title>
+    
+    <!-- Tailwind CSS -->
+    <script src="https://cdn.tailwindcss.com"></script>
+    
+    <!-- SheetJS for Excel processing -->
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
+    
+    <!-- FontAwesome -->
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
+
+    <!-- Firebase SDKs (Modular) -->
+    <script type="module">
+        import { initializeApp } from "https://www.gstatic.com/firebasejs/10.8.0/firebase-app.js";
+        import { getFirestore, doc, getDoc, setDoc, onSnapshot } from "https://www.gstatic.com/firebasejs/10.8.0/firebase-firestore.js";
+
+        // ==========================================
+        // ★★★ Firebase 設定已更新 ★★★
+        // ==========================================
+        const firebaseConfig = {
+            apiKey: "AIzaSyA2Q16Y2sHSY1rB9xwraIJAj7Uzp9_2QBM",
+            authDomain: "radiology-emergency-board.firebaseapp.com",
+            projectId: "radiology-emergency-board",
+            storageBucket: "radiology-emergency-board.firebasestorage.app",
+            messagingSenderId: "611125071012",
+            appId: "1:611125071012:web:8f95710f6f7fa950ed2a31",
+            measurementId: "G-3TPYP1RE7H"
+        };
+        // ==========================================
+
+        // Initialize Firebase
+        let db;
+        let isCloudActive = false;
+
+        try {
+            // Check if config is filled (It is now!)
+            if (firebaseConfig.projectId !== "您的專案ID") {
+                const app = initializeApp(firebaseConfig);
+                db = getFirestore(app);
+                isCloudActive = true;
+                console.log("Firebase Connected successfully!");
+                
+                // Expose specific functions to window for the legacy code to use
+                window.cloudDB = {
+                    saveConfig: async (data) => {
+                        try {
+                            // Only save if data is valid
+                            if(!data) return;
+                            await setDoc(doc(db, "dashboard", "config"), data);
+                            // alert("雲端儲存成功！所有看板將自動更新。"); // Optional: Remove alert to be less annoying on auto-save
+                            console.log("Config saved to cloud");
+                        } catch (e) {
+                            console.error("Save Config Error:", e);
+                            alert("雲端儲存失敗 (可能是權限問題，請確認 Firestore 規則): " + e.message);
+                        }
+                    },
+                    saveRoster: async (data) => {
+                        try {
+                            if(!data) return;
+                            await setDoc(doc(db, "dashboard", "roster"), { data: JSON.stringify(data) }); 
+                            alert("排班表已同步至雲端！");
+                        } catch (e) {
+                            console.error("Save Roster Error:", e);
+                            alert("排班上傳失敗: " + e.message);
+                        }
+                    },
+                    listenToChanges: (onConfigUpdate, onRosterUpdate) => {
+                        // Real-time listener for Config
+                        onSnapshot(doc(db, "dashboard", "config"), (doc) => {
+                            if(doc.exists()) {
+                                const data = doc.data();
+                                console.log("Received Config update from cloud");
+                                onConfigUpdate(data);
+                            } else {
+                                console.log("No config found in cloud yet.");
+                            }
+                        }, (error) => {
+                            console.error("Listen Config Error:", error);
+                        });
+
+                        // Real-time listener for Roster
+                        onSnapshot(doc(db, "dashboard", "roster"), (doc) => {
+                            if(doc.exists()) {
+                                const raw = doc.data().data;
+                                if(raw) {
+                                    console.log("Received Roster update from cloud");
+                                    onRosterUpdate(JSON.parse(raw));
+                                }
+                            }
+                        }, (error) => {
+                             console.error("Listen Roster Error:", error);
+                        });
+                    }
+                };
+            } else {
+                console.warn("Firebase Config appears to be placeholder. Running in LocalStorage mode.");
+            }
+        } catch (e) {
+            console.error("Firebase Init Error:", e);
+            alert("Firebase 連線初始化失敗，將切換回單機模式。\n錯誤: " + e.message);
+        }
+
+        window.isCloudActive = isCloudActive;
+    </script>
+
+    <style>
+        @import url('https://fonts.googleapis.com/css2?family=Noto+Sans+TC:wght@400;500;700;900&display=swap');
+        
+        :root {
+            --emergency-red: #dc2626;
+            --emergency-dark: #111827;
+            --warning-yellow: #facc15;
+        }
+
+        body {
+            font-family: 'Noto Sans TC', sans-serif;
+            background-color: #f3f4f6;
+            background-image: radial-gradient(#e5e7eb 1px, transparent 1px);
+            background-size: 20px 20px;
+        }
+
+        .hazard-stripe {
+            background: repeating-linear-gradient(45deg, #b91c1c, #b91c1c 10px, #991b1b 10px, #991b1b 20px);
+        }
+        
+        .hazard-border-top {
+            position: relative;
+        }
+        .hazard-border-top::before {
+            content: "";
+            position: absolute;
+            top: 0; left: 0; right: 0;
+            height: 8px;
+            background: repeating-linear-gradient(45deg, #facc15, #facc15 10px, #000 10px, #000 20px);
+        }
+
+        .dashboard-table {
+            border-collapse: collapse;
+            width: 100%;
+            background: white;
+            box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.1);
+            table-layout: fixed;
+            border: 2px solid #374151;
+        }
+        .dashboard-table th, .dashboard-table td {
+            border: 1px solid #9ca3af;
+            padding: 0.75rem;
+            text-align: center;
+            vertical-align: middle;
+            word-wrap: break-word;
+        }
+        .dashboard-table th {
+            background-color: #1f2937;
+            color: white;
+            font-weight: 900;
+            font-size: 1.25rem;
+            letter-spacing: 0.05em;
+            border-bottom: 4px solid #dc2626;
+        }
+        .dashboard-table .sub-header {
+            background-color: #fef2f2;
+            color: #991b1b;
+            font-weight: 800;
+            font-size: 1.1rem;
+            border-right: 3px solid #dc2626;
+        }
+        .role-cell {
+            font-weight: 700;
+            color: #111827;
+            font-size: 1.25rem;
+            min-height: 3.5rem;
+            line-height: 1.4;
+        }
+        .person-entry {
+            display: block;
+            padding: 2px 0;
+        }
+
+        input[type="date"] {
+            font-family: 'Noto Sans TC', sans-serif;
+            font-weight: bold;
+            background: transparent;
+            border: 2px solid #dc2626;
+            color: #dc2626;
+            padding: 4px 8px;
+            border-radius: 6px;
+            cursor: pointer;
+            font-size: 1.25rem;
+        }
+        
+        @media print {
+            .no-print { display: none; }
+            body { background: white; background-image: none; }
+            .hazard-stripe, .hazard-border-top::before { -webkit-print-color-adjust: exact; print-color-adjust: exact; }
+        }
+    </style>
+</head>
+<body class="min-h-screen flex flex-col text-gray-900">
+
+    <!-- Status Bar for Cloud Connection -->
+    <div id="cloud-status" class="bg-gray-800 text-white text-xs text-center p-1 hidden transition-colors duration-500">
+        <span id="cloud-status-text"><i class="fas fa-cloud mr-1"></i> 連線中...</span>
+    </div>
+
+    <!-- ================= DASHBOARD VIEW ================= -->
+    <div id="dashboard-view" class="flex-grow p-4 md:p-6 transition-all duration-300 max-w-[1920px] mx-auto w-full">
+        
+        <!-- Header Info -->
+        <header class="mb-6 bg-white rounded-lg shadow-md overflow-hidden border border-gray-300">
+            <div class="h-3 hazard-stripe"></div>
+            <div class="p-6">
+                <div class="flex flex-col md:flex-row justify-between items-start md:items-center gap-4">
+                    <h1 class="text-3xl md:text-4xl font-black text-gray-900 leading-tight whitespace-pre-line tracking-tight uppercase" id="display-title"></h1>
+                    <div class="flex items-center bg-red-50 px-4 py-2 rounded-lg border border-red-200 shadow-inner">
+                        <label for="date-picker" class="font-bold text-gray-700 mr-2 uppercase text-sm tracking-wider">應變日期</label>
+                        <input type="date" id="date-picker" onchange="renderDashboard()">
+                    </div>
+                </div>
+
+                <div class="mt-6 flex flex-wrap gap-4 md:gap-8 p-4 bg-gray-100 rounded-md border-l-8 border-gray-800 items-center">
+                    <div class="flex items-center">
+                        <div class="bg-blue-900 text-white p-2 rounded-full mr-3 w-10 h-10 flex items-center justify-center"><i class="fas fa-user-tie"></i></div>
+                        <div>
+                            <div class="text-xs text-gray-500 font-bold uppercase">防火管理人</div>
+                            <div id="display-manager" class="text-xl font-bold"></div>
+                        </div>
+                    </div>
+                    <div class="w-px h-10 bg-gray-300 hidden md:block"></div>
+                    <div class="flex items-center">
+                        <div class="bg-green-700 text-white p-2 rounded-full mr-3 w-10 h-10 flex items-center justify-center"><i class="fas fa-user-shield"></i></div>
+                        <div>
+                            <div class="text-xs text-gray-500 font-bold uppercase">代理人</div>
+                            <div id="display-agent" class="text-xl font-bold"></div>
+                        </div>
+                    </div>
+                    <div class="flex-grow"></div>
+                    <div class="flex items-center bg-red-600 text-white px-6 py-3 rounded shadow-lg transform scale-100 hover:scale-105 transition duration-300 animate-pulse-slow">
+                        <i class="fas fa-phone-volume fa-lg mr-3"></i>
+                        <div class="text-right">
+                            <div class="text-xs font-bold opacity-80 uppercase">緊急通報</div>
+                            <div id="display-phone" class="text-3xl font-black font-mono"></div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </header>
+
+        <!-- Main Roster Table -->
+        <div class="overflow-x-auto rounded-lg shadow-xl mb-6 hazard-border-top">
+            <table class="dashboard-table">
+                <thead>
+                    <tr>
+                        <th class="w-32 uppercase tracking-wider">任務編組</th>
+                        <th class="uppercase tracking-wider">日班</th>
+                        <th class="uppercase tracking-wider">小夜班</th>
+                        <th class="uppercase tracking-wider">大夜班</th>
+                    </tr>
+                </thead>
+                <tbody id="roster-body"></tbody>
+            </table>
+        </div>
+
+        <!-- Static Assets Info Grid (4 Blocks) -->
+        <div class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-4 mt-6">
+            <div class="bg-white rounded-lg shadow-md border-t-4 border-blue-600 p-4 relative overflow-hidden group hover:shadow-lg transition">
+                <div class="absolute top-0 right-0 p-2 opacity-10 group-hover:opacity-20 transition"><i class="fas fa-microscope fa-4x text-blue-600"></i></div>
+                <h3 class="text-lg font-black text-gray-800 mb-2 flex items-center"><span class="bg-blue-600 text-white w-6 h-6 rounded flex items-center justify-center text-sm mr-2">1</span> 貴重儀器</h3>
+                <p id="display-assets-valuable" class="text-gray-700 whitespace-pre-line text-base font-medium pl-1"></p>
+            </div>
+            <div class="bg-white rounded-lg shadow-md border-t-4 border-yellow-500 p-4 relative overflow-hidden group hover:shadow-lg transition">
+                <div class="absolute top-0 right-0 p-2 opacity-10 group-hover:opacity-20 transition"><i class="fas fa-biohazard fa-4x text-yellow-500"></i></div>
+                <h3 class="text-lg font-black text-gray-800 mb-2 flex items-center"><span class="bg-yellow-500 text-black w-6 h-6 rounded flex items-center justify-center text-sm mr-2">2</span> 危害物質</h3>
+                <p id="display-assets-hazard" class="text-gray-700 whitespace-pre-line text-base font-medium pl-1"></p>
+            </div>
+            <div class="bg-white rounded-lg shadow-md border-t-4 border-green-600 p-4 relative overflow-hidden group hover:shadow-lg transition">
+                <div class="absolute top-0 right-0 p-2 opacity-10 group-hover:opacity-20 transition"><i class="fas fa-fire-extinguisher fa-4x text-green-600"></i></div>
+                <h3 class="text-lg font-black text-gray-800 mb-2 flex items-center"><span class="bg-green-600 text-white w-6 h-6 rounded flex items-center justify-center text-sm mr-2">3</span> 應變設備</h3>
+                <p id="display-assets-equipment" class="text-gray-700 whitespace-pre-line text-base font-medium pl-1"></p>
+            </div>
+            <div class="bg-white rounded-lg shadow-md border-t-4 border-gray-600 p-4 relative overflow-hidden group hover:shadow-lg transition">
+                <div class="absolute top-0 right-0 p-2 opacity-10 group-hover:opacity-20 transition"><i class="fas fa-exclamation-circle fa-4x text-gray-600"></i></div>
+                <h3 class="text-lg font-black text-gray-800 mb-2 flex items-center"><span class="bg-gray-600 text-white w-6 h-6 rounded flex items-center justify-center text-sm mr-2">4</span> 備註事項</h3>
+                <p id="display-assets-remarks" class="text-gray-700 whitespace-pre-line text-base font-medium pl-1"></p>
+            </div>
+        </div>
+
+        <!-- NEW: Floor Plans / Images Section -->
+        <div id="image-section" class="mt-6 hidden">
+            <h3 class="text-xl font-black text-gray-800 mb-3 border-l-4 border-red-600 pl-3 uppercase"><i class="fas fa-map-marked-alt text-red-600 mr-2"></i>防災地圖與平面圖</h3>
+            <div id="image-gallery" class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6"></div>
+        </div>
+    </div>
+
+    <!-- ================= LOGIN MODAL ================= -->
+    <div id="login-modal" class="hidden fixed inset-0 bg-gray-900 bg-opacity-95 z-[60] flex items-center justify-center backdrop-blur-sm">
+        <div class="bg-white p-8 rounded-lg shadow-2xl w-96 border-t-8 border-red-600 relative">
+            <button onclick="closeLogin()" class="absolute top-2 right-2 text-gray-400 hover:text-gray-600"><i class="fas fa-times"></i></button>
+            <h2 class="text-2xl font-black text-gray-800 mb-6 text-center tracking-tight"><i class="fas fa-user-lock text-red-600 mr-2"></i>管理者登入</h2>
+            <div class="space-y-4">
+                <div>
+                    <label class="block text-sm font-bold text-gray-700 mb-1">管理帳號</label>
+                    <div class="relative">
+                        <i class="fas fa-user absolute left-3 top-3 text-gray-400"></i>
+                        <input type="text" id="login-acc" class="w-full border-2 border-gray-300 rounded pl-10 p-2 focus:border-red-500 focus:outline-none transition font-mono font-bold" placeholder="請輸入帳號">
+                    </div>
+                </div>
+                <div>
+                    <label class="block text-sm font-bold text-gray-700 mb-1">驗證密碼</label>
+                    <div class="relative">
+                        <i class="fas fa-key absolute left-3 top-3 text-gray-400"></i>
+                        <input type="password" id="login-pwd" class="w-full border-2 border-gray-300 rounded pl-10 p-2 focus:border-red-500 focus:outline-none transition font-mono font-bold" placeholder="請輸入密碼" onkeypress="handleEnter(event)">
+                    </div>
+                </div>
+                <div id="login-error" class="text-red-600 text-sm font-bold text-center bg-red-50 p-2 rounded hidden"><i class="fas fa-exclamation-triangle mr-1"></i>帳號或密碼錯誤</div>
+                <div class="pt-2">
+                    <button onclick="performLogin()" class="w-full bg-red-600 hover:bg-red-700 text-white py-3 rounded-lg font-bold shadow-lg transform active:scale-95 transition">確認登入</button>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- ================= ADMIN PANEL ================= -->
+    <div id="admin-panel" class="hidden fixed inset-0 bg-gray-900 bg-opacity-95 z-50 overflow-y-auto backdrop-blur-sm">
+        <div class="container mx-auto p-4 md:p-8">
+            <div class="flex justify-between items-center mb-6 border-b border-gray-700 pb-4 sticky top-0 bg-gray-900 z-10 pt-4">
+                <div class="flex items-center">
+                    <h2 class="text-2xl font-bold text-white mr-4"><i class="fas fa-cogs mr-2 text-yellow-500"></i>後台管理系統</h2>
+                    <span id="cloud-indicator" class="text-xs bg-gray-700 text-gray-400 px-2 py-1 rounded">本機模式</span>
+                </div>
+                
+                <div class="flex gap-4">
+                    <span class="text-gray-400 text-sm flex items-center font-mono hidden md:flex"><i class="fas fa-user-check mr-2"></i>Logged in as: T16832</span>
+                    <button onclick="toggleAdmin()" class="bg-red-600 hover:bg-red-700 text-white px-4 py-2 rounded-lg font-bold shadow transition"><i class="fas fa-sign-out-alt mr-2"></i>關閉</button>
+                </div>
+            </div>
+
+            <div class="grid grid-cols-1 lg:grid-cols-3 gap-6">
+                <!-- 1. Global Settings -->
+                <div class="bg-white rounded-lg p-6 shadow-lg border-t-4 border-blue-500">
+                    <h3 class="text-xl font-bold mb-4 text-gray-800 pb-2">1. 全域與資訊設定</h3>
+                    <div class="space-y-4 max-h-[60vh] overflow-y-auto pr-2 custom-scrollbar">
+                        <div><label class="block text-sm font-bold text-gray-700 mb-1">標題名稱</label><textarea id="config-title" rows="2" class="w-full border rounded p-2 text-sm focus:ring-2 focus:ring-blue-500"></textarea></div>
+                        <div class="grid grid-cols-2 gap-2">
+                            <div><label class="block text-sm font-bold text-gray-700 mb-1">防火管理人</label><input type="text" id="config-manager" class="w-full border rounded p-2 text-sm"></div>
+                            <div><label class="block text-sm font-bold text-gray-700 mb-1">代理人</label><input type="text" id="config-agent" class="w-full border rounded p-2 text-sm"></div>
+                        </div>
+                        <div><label class="block text-sm font-bold text-gray-700 mb-1">通報電話</label><input type="text" id="config-phone" class="w-full border rounded p-2 text-sm"></div>
+                        <hr class="border-gray-200">
+                        <div class="grid grid-cols-1 gap-3">
+                            <div><label class="text-xs font-bold text-blue-700">1. 貴重儀器</label><textarea id="config-valuable" rows="2" class="w-full border rounded p-2 text-sm"></textarea></div>
+                            <div><label class="text-xs font-bold text-yellow-700">2. 危害物質</label><textarea id="config-hazard" rows="2" class="w-full border rounded p-2 text-sm"></textarea></div>
+                            <div><label class="text-xs font-bold text-green-700">3. 應變設備</label><textarea id="config-equipment" rows="2" class="w-full border rounded p-2 text-sm"></textarea></div>
+                            <div><label class="text-xs font-bold text-gray-700">4. 備註事項</label><textarea id="config-remarks" rows="2" class="w-full border rounded p-2 text-sm"></textarea></div>
+                        </div>
+                        <button onclick="saveGlobalConfig()" class="w-full bg-blue-600 hover:bg-blue-700 text-white py-2 rounded-lg font-bold shadow transition"><i class="fas fa-cloud-upload-alt mr-2"></i>儲存並同步</button>
+                    </div>
+                </div>
+
+                <!-- 2. Roster Upload -->
+                <div class="bg-white rounded-lg p-6 shadow-lg border-t-4 border-green-500">
+                    <h3 class="text-xl font-bold mb-4 text-gray-800 pb-2">2. 排班表上傳</h3>
+                    <div class="bg-green-50 p-3 rounded text-sm text-green-800 mb-4 border border-green-200"><i class="fas fa-check-circle mr-1"></i>系統會自動抓取對應日期的資料。</div>
+                    <div class="border-2 border-dashed border-gray-400 rounded-lg p-6 text-center hover:bg-gray-50 transition cursor-pointer group relative">
+                        <input type="file" id="roster-upload" accept=".xlsx, .csv" class="absolute inset-0 w-full h-full opacity-0 cursor-pointer" onchange="handleFileUpload(this)">
+                        <i class="fas fa-cloud-upload-alt text-4xl text-green-500 mb-2 group-hover:scale-110 transition"></i>
+                        <p class="font-bold text-gray-700">上傳 Excel/CSV</p>
+                    </div>
+                    <div id="upload-status" class="mt-2 text-xs font-bold text-center hidden"></div>
+                    <button onclick="downloadTemplate()" class="mt-4 w-full bg-gray-600 hover:bg-gray-700 text-white py-2 rounded font-bold text-sm shadow"><i class="fas fa-download mr-2"></i>下載範本</button>
+                    <hr class="my-6 border-gray-300">
+                    <h3 class="text-xl font-bold mb-4 text-gray-800 pb-2">4. 平面圖管理</h3>
+                    <div class="bg-yellow-50 p-2 rounded text-xs text-yellow-800 mb-2 border border-yellow-200"><i class="fas fa-exclamation-triangle mr-1"></i>圖片請勿過大 (>500KB)，以免同步失敗。</div>
+                    <div class="flex gap-2">
+                        <input type="file" id="image-upload" accept="image/*" class="hidden" onchange="handleImageUpload(this)">
+                        <button onclick="document.getElementById('image-upload').click()" class="flex-1 bg-yellow-600 hover:bg-yellow-700 text-white py-2 rounded font-bold text-sm shadow"><i class="fas fa-image mr-2"></i>新增圖片</button>
+                        <button onclick="clearAllImages()" class="bg-red-600 hover:bg-red-700 text-white px-3 py-2 rounded font-bold text-sm shadow" title="清除所有圖片"><i class="fas fa-trash"></i></button>
+                    </div>
+                    <div id="admin-image-list" class="mt-4 space-y-2 max-h-40 overflow-y-auto"></div>
+                </div>
+
+                <!-- 3. Role Mapping -->
+                <div class="bg-white rounded-lg p-6 shadow-lg border-t-4 border-purple-500 lg:col-span-1">
+                    <h3 class="text-xl font-bold mb-4 text-gray-800 pb-2">3. 崗位代號映射</h3>
+                    <p class="text-xs text-gray-500 mb-2">多人請用逗號分隔 (例: A1, A2)</p>
+                    <div class="overflow-y-auto max-h-[60vh] pr-2 custom-scrollbar">
+                        <table class="w-full text-sm border-collapse">
+                            <tbody id="mapping-body" class="space-y-4 block"></tbody>
+                        </table>
+                    </div>
+                    <button onclick="saveMappingConfig()" class="w-full mt-4 bg-purple-600 hover:bg-purple-700 text-white py-2 rounded-lg font-bold shadow transition"><i class="fas fa-sync-alt mr-2"></i>更新並同步</button>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Floating Toggle Button -->
+    <button onclick="toggleAdmin()" class="fixed bottom-6 right-6 bg-gray-900 text-white w-14 h-14 rounded-full shadow-2xl opacity-50 hover:opacity-100 hover:scale-110 transition z-40 no-print flex items-center justify-center border-2 border-yellow-500" title="開啟後台設定">
+        <i class="fas fa-cog fa-2x animate-spin-slow"></i>
+    </button>
+
+    <script>
+        // ================= STATE & CONFIG =================
+        const STORE_KEY_CONFIG = 'fire_dashboard_config_v3'; 
+        const STORE_KEY_ROSTER = 'fire_dashboard_roster';
+        const AUTH_CREDENTIALS = { id: 'T16832', pass: 'suben1204' };
+
+        const defaultConfig = {
+            title: "臺中市立老人復健綜合醫院 (委託財團法人中國醫藥大學興建經營)\n醫學影像科 自衛消防編組任務表",
+            manager: "蘇峯毅",
+            agent: "值班主治醫師",
+            phone: "3333",
+            assets: {
+                valuable: "1. MRI磁振造影儀\n2. CT電腦斷層掃描儀\n3. 血管攝影機",
+                hazard: "1. 顯影劑 (庫房A)\n2. 放射性同位素 (管制區)",
+                equipment: "1. 滅火器 (各檢查室門口)\n2. 消防栓 (走廊兩側)",
+                remarks: "如遇緊急狀況，請優先引導病患至安全區域。"
+            },
+            mapping: {
+                "day_leader": "MR-1", "day_notify": "CT-1", "day_extinguish": "XR-1, XR-2", "day_evacuate": "US-1, US-2", "day_rescue": "NM-1", "day_medical": "ANGIO-1",
+                "eve_leader": "ER-E-Leader", "eve_notify": "ER-E-1", "eve_extinguish": "ER-E-2", "eve_evacuate": "ER-E-3", "eve_rescue": "ER-E-4", "eve_medical": "ER-E-5",
+                "night_leader": "ER-N-Leader", "night_notify": "ER-N-1", "night_extinguish": "ER-N-2", "night_evacuate": "ER-N-3", "night_rescue": "ER-N-4", "night_medical": "ER-N-5"
+            },
+            images: []
+        };
+
+        const mockRoster = {
+            "2026-02-18": {
+                "MR-1": "林玉芳", "CT-1": "陳志明", "XR-1": "王大明", "XR-2": "陳小花", 
+                "US-1": "李小華", "US-2": "測試員A", "NM-1": "張美麗", "ANGIO-1": "吳建國",
+                "ER-E-Leader": "劉志偉", "ER-E-1": "黃阿嬌", "ER-E-2": "趙子龍",
+                "ER-E-3": "孫悟空", "ER-E-4": "豬八戒", "ER-E-5": "沙悟淨",
+                "ER-N-Leader": "曹孟德", "ER-N-1": "關雲長", "ER-N-2": "張翼德",
+                "ER-N-3": "馬孟起", "ER-N-4": "黃漢升", "ER-N-5": "趙子龍"
+            }
+        };
+
+        const tasks = [
+            { id: "leader", name: "通報班 / 班長", icon: "fa-bullhorn" },
+            { id: "notify", name: "通報班", icon: "fa-phone-volume" },
+            { id: "extinguish", name: "滅火班", icon: "fa-fire-extinguisher" },
+            { id: "evacuate", name: "避難引導班", icon: "fa-person-running" },
+            { id: "rescue", name: "安全防護班", icon: "fa-shield-alt" },
+            { id: "medical", name: "救護班", icon: "fa-user-nurse" }
+        ];
+
+        let appConfig = {};
+        let rosterData = {};
+
+        // ================= INITIALIZATION =================
+        document.addEventListener('DOMContentLoaded', () => {
+            // Check cloud
+            setTimeout(() => {
+                if (window.isCloudActive && window.cloudDB) {
+                    const status = document.getElementById('cloud-status');
+                    const text = document.getElementById('cloud-status-text');
+                    const indicator = document.getElementById('cloud-indicator');
+                    
+                    status.classList.remove('hidden');
+                    status.className = "bg-green-700 text-white text-xs text-center p-1";
+                    text.innerHTML = '<i class="fas fa-cloud-upload-alt mr-1"></i> 雲端同步中';
+                    
+                    indicator.textContent = "雲端同步中";
+                    indicator.className = "text-xs bg-green-600 text-white px-2 py-1 rounded";
+                    
+                    // Listen for changes
+                    window.cloudDB.listenToChanges(
+                        (newConfig) => {
+                            console.log("Got new Config from cloud");
+                            appConfig = { ...defaultConfig, ...newConfig };
+                            localStorage.setItem(STORE_KEY_CONFIG, JSON.stringify(appConfig));
+                            initUI(); // refresh admin ui
+                            renderDashboard();
+                        },
+                        (newRoster) => {
+                            console.log("Got new Roster from cloud");
+                            rosterData = newRoster;
+                            localStorage.setItem(STORE_KEY_ROSTER, JSON.stringify(rosterData));
+                            renderDashboard();
+                        }
+                    );
+                } else {
+                    // Fallback to local
+                    loadDataLocal();
+                    initUI();
+                    renderDashboard();
+                    renderAdminImages();
+                }
+            }, 1000); // Wait for module to load
+
+            const today = new Date().toISOString().split('T')[0];
+            document.getElementById('date-picker').value = today;
+        });
+
+        function loadDataLocal() {
+            const savedConfig = localStorage.getItem(STORE_KEY_CONFIG);
+            if (savedConfig) {
+                const parsed = JSON.parse(savedConfig);
+                appConfig = { ...defaultConfig, ...parsed, assets: { ...defaultConfig.assets, ...(parsed.assets || {}) }, images: parsed.images || [] };
+            } else {
+                appConfig = JSON.parse(JSON.stringify(defaultConfig));
+                localStorage.setItem(STORE_KEY_CONFIG, JSON.stringify(appConfig));
+            }
+
+            const savedRoster = localStorage.getItem(STORE_KEY_ROSTER);
+            if (savedRoster) {
+                rosterData = JSON.parse(savedRoster);
+            } else {
+                rosterData = JSON.parse(JSON.stringify(mockRoster));
+                localStorage.setItem(STORE_KEY_ROSTER, JSON.stringify(rosterData));
+            }
+        }
+
+        function initUI() {
+            const tbody = document.getElementById('roster-body');
+            tbody.innerHTML = '';
+            tasks.forEach(task => {
+                const tr = document.createElement('tr');
+                tr.innerHTML = `
+                    <td class="sub-header text-left pl-4"><i class="fas ${task.icon} mr-2 w-6 text-center"></i>${task.name}</td>
+                    <td id="view-day_${task.id}" class="role-cell bg-white">--</td>
+                    <td id="view-eve_${task.id}" class="role-cell bg-gray-50">--</td>
+                    <td id="view-night_${task.id}" class="role-cell bg-gray-100">--</td>
+                `;
+                tbody.appendChild(tr);
+            });
+
+            const mapBody = document.getElementById('mapping-body');
+            mapBody.innerHTML = '';
+            tasks.forEach(task => {
+                const row = document.createElement('tr');
+                row.className = "border-b pb-4 mb-4 block";
+                row.innerHTML = `
+                    <td class="block font-bold text-gray-700 mb-1"><i class="fas ${task.icon} mr-1"></i>${task.name}</td>
+                    <td class="grid grid-cols-3 gap-2">
+                        <input type="text" id="map-day_${task.id}" class="border rounded px-2 py-1 text-sm border-blue-300 focus:ring-2 focus:ring-blue-500 outline-none" placeholder="日班代號" value="${appConfig.mapping['day_' + task.id] || ''}">
+                        <input type="text" id="map-eve_${task.id}" class="border rounded px-2 py-1 text-sm border-indigo-300 focus:ring-2 focus:ring-indigo-500 outline-none" placeholder="小夜代號" value="${appConfig.mapping['eve_' + task.id] || ''}">
+                        <input type="text" id="map-night_${task.id}" class="border rounded px-2 py-1 text-sm border-purple-300 focus:ring-2 focus:ring-purple-500 outline-none" placeholder="大夜代號" value="${appConfig.mapping['night_' + task.id] || ''}">
+                    </td>
+                `;
+                mapBody.appendChild(row);
+            });
+
+            document.getElementById('config-title').value = appConfig.title;
+            document.getElementById('config-manager').value = appConfig.manager;
+            document.getElementById('config-agent').value = appConfig.agent;
+            document.getElementById('config-phone').value = appConfig.phone;
+            document.getElementById('config-valuable').value = appConfig.assets.valuable || '';
+            document.getElementById('config-hazard').value = appConfig.assets.hazard || '';
+            document.getElementById('config-equipment').value = appConfig.assets.equipment || '';
+            document.getElementById('config-remarks').value = appConfig.assets.remarks || '';
+            
+            renderAdminImages();
+        }
+
+        function renderDashboard() {
+            const selectedDate = document.getElementById('date-picker').value;
+            
+            document.getElementById('display-title').textContent = appConfig.title;
+            document.getElementById('display-manager').textContent = appConfig.manager;
+            document.getElementById('display-agent').textContent = appConfig.agent;
+            document.getElementById('display-phone').textContent = appConfig.phone;
+            document.getElementById('display-assets-valuable').textContent = appConfig.assets.valuable || '(未設定)';
+            document.getElementById('display-assets-hazard').textContent = appConfig.assets.hazard || '(未設定)';
+            document.getElementById('display-assets-equipment').textContent = appConfig.assets.equipment || '(未設定)';
+            document.getElementById('display-assets-remarks').textContent = appConfig.assets.remarks || '(未設定)';
+
+            const todaysData = rosterData[selectedDate] || {};
+            
+            for (const [uiKey, excelCodeString] of Object.entries(appConfig.mapping)) {
+                const cellId = `view-${uiKey}`;
+                const cell = document.getElementById(cellId);
+                
+                if (cell && excelCodeString) {
+                    const codes = excelCodeString.split(/[,，]/).map(s => s.trim()).filter(s => s);
+                    let htmlContent = '';
+                    let hasPerson = false;
+                    if (codes.length > 0) {
+                        const names = codes.map(code => {
+                            const name = todaysData[code];
+                            if (name) { hasPerson = true; return `<span class="person-entry">${name}</span>`; }
+                            else { return `<span class="person-entry text-gray-400 text-sm italic font-normal">(${code} 缺)</span>`; }
+                        });
+                        htmlContent = names.join('');
+                    }
+                    cell.innerHTML = hasPerson ? htmlContent : (htmlContent || `<span class="text-gray-300">--</span>`);
+                    if(hasPerson) cell.classList.remove('text-gray-400');
+                } else if (cell) cell.innerHTML = `<span class="text-gray-300">--</span>`;
+            }
+
+            const gallery = document.getElementById('image-gallery');
+            const section = document.getElementById('image-section');
+            gallery.innerHTML = '';
+            
+            if (appConfig.images && appConfig.images.length > 0) {
+                section.classList.remove('hidden');
+                appConfig.images.forEach((imgData, index) => {
+                    const div = document.createElement('div');
+                    div.className = "bg-white p-2 rounded shadow border border-gray-300";
+                    div.innerHTML = `<img src="${imgData}" class="w-full h-auto rounded hover:scale-[1.02] transition cursor-pointer" onclick="window.open(this.src)"><div class="mt-2 text-center text-sm font-bold text-gray-600">圖資 ${index + 1}</div>`;
+                    gallery.appendChild(div);
+                });
+            } else { section.classList.add('hidden'); }
+        }
+
+        // ================= IMAGE HANDLING =================
+        function handleImageUpload(input) {
+            const file = input.files[0];
+            if (!file) return;
+            if (file.size > 500000) { if(!confirm("圖片較大 (>500KB)，可能會導致雲端同步變慢或失敗。建議先縮圖。確定要繼續嗎？")) return; }
+
+            const reader = new FileReader();
+            reader.onload = function(e) {
+                const base64 = e.target.result;
+                appConfig.images.push(base64);
+                // Save locally first to feel instant
+                localStorage.setItem(STORE_KEY_CONFIG, JSON.stringify(appConfig));
+                renderDashboard();
+                renderAdminImages();
+                // Then try sync
+                if(window.isCloudActive) window.cloudDB.saveConfig(appConfig);
+            };
+            reader.readAsDataURL(file);
+            input.value = '';
+        }
+
+        function renderAdminImages() {
+            const list = document.getElementById('admin-image-list');
+            list.innerHTML = '';
+            if (appConfig.images && appConfig.images.length > 0) {
+                appConfig.images.forEach((img, idx) => {
+                    const row = document.createElement('div');
+                    row.className = "flex items-center justify-between bg-gray-100 p-2 rounded border";
+                    row.innerHTML = `<div class="flex items-center"><img src="${img}" class="w-10 h-10 object-cover rounded mr-3"><span class="text-sm font-bold text-gray-700">圖片 ${idx + 1}</span></div><button onclick="deleteImage(${idx})" class="text-red-500 hover:text-red-700 px-2 font-bold"><i class="fas fa-trash-alt"></i></button>`;
+                    list.appendChild(row);
+                });
+            } else { list.innerHTML = '<div class="text-gray-400 text-sm text-center">目前無圖片</div>'; }
+        }
+
+        function deleteImage(index) {
+            if(confirm('確定要刪除這張圖片嗎？')) {
+                appConfig.images.splice(index, 1);
+                localStorage.setItem(STORE_KEY_CONFIG, JSON.stringify(appConfig));
+                renderDashboard();
+                renderAdminImages();
+                if(window.isCloudActive) window.cloudDB.saveConfig(appConfig);
+            }
+        }
+        function clearAllImages() {
+            if(confirm('確定要清空所有圖片嗎？')) {
+                appConfig.images = [];
+                localStorage.setItem(STORE_KEY_CONFIG, JSON.stringify(appConfig));
+                renderDashboard();
+                renderAdminImages();
+                if(window.isCloudActive) window.cloudDB.saveConfig(appConfig);
+            }
+        }
+
+        // ================= AUTH & ADMIN FUNCTIONS =================
+        function toggleAdmin() {
+            const panel = document.getElementById('admin-panel');
+            const isHidden = panel.classList.contains('hidden');
+            if (isHidden) {
+                const isLoggedIn = sessionStorage.getItem('is_admin_logged_in') === 'true';
+                if (isLoggedIn) panel.classList.remove('hidden');
+                else {
+                    document.getElementById('login-modal').classList.remove('hidden');
+                    document.getElementById('login-acc').value = '';
+                    document.getElementById('login-pwd').value = '';
+                    document.getElementById('login-error').classList.add('hidden');
+                    setTimeout(() => document.getElementById('login-acc').focus(), 100);
+                }
+            } else panel.classList.add('hidden');
+        }
+
+        function closeLogin() { document.getElementById('login-modal').classList.add('hidden'); }
+
+        function performLogin() {
+            const acc = document.getElementById('login-acc').value.trim();
+            const pwd = document.getElementById('login-pwd').value.trim();
+            if (acc === AUTH_CREDENTIALS.id && pwd === AUTH_CREDENTIALS.pass) {
+                sessionStorage.setItem('is_admin_logged_in', 'true');
+                closeLogin();
+                document.getElementById('admin-panel').classList.remove('hidden');
+            } else document.getElementById('login-error').classList.remove('hidden');
+        }
+
+        function handleEnter(event) { if (event.key === 'Enter') performLogin(); }
+
+        function saveGlobalConfig() {
+            appConfig.title = document.getElementById('config-title').value;
+            appConfig.manager = document.getElementById('config-manager').value;
+            appConfig.agent = document.getElementById('config-agent').value;
+            appConfig.phone = document.getElementById('config-phone').value;
+            appConfig.assets.valuable = document.getElementById('config-valuable').value;
+            appConfig.assets.hazard = document.getElementById('config-hazard').value;
+            appConfig.assets.equipment = document.getElementById('config-equipment').value;
+            appConfig.assets.remarks = document.getElementById('config-remarks').value;
+
+            localStorage.setItem(STORE_KEY_CONFIG, JSON.stringify(appConfig));
+            renderDashboard();
+
+            if(window.isCloudActive) {
+                window.cloudDB.saveConfig(appConfig);
+            } else {
+                alert('已儲存在本機 (尚未同步雲端，請檢查 Firebase 設定)');
+            }
+        }
+
+        function saveMappingConfig() {
+            const inputs = document.querySelectorAll('input[id^="map-"]');
+            inputs.forEach(input => {
+                const key = input.id.replace('map-', '');
+                appConfig.mapping[key] = input.value.trim();
+            });
+            localStorage.setItem(STORE_KEY_CONFIG, JSON.stringify(appConfig));
+            renderDashboard();
+
+            if(window.isCloudActive) {
+                window.cloudDB.saveConfig(appConfig);
+            } else {
+                alert('已儲存在本機 (尚未同步雲端，請檢查 Firebase 設定)');
+            }
+        }
+
+        // ================= EXCEL LOGIC =================
+        function handleFileUpload(input) {
+            const file = input.files[0];
+            if (!file) return;
+            document.getElementById('upload-status').style.display = 'block';
+            document.getElementById('upload-status').textContent = "處理中...";
+
+            const reader = new FileReader();
+            reader.onload = function(e) {
+                try {
+                    const data = new Uint8Array(e.target.result);
+                    const workbook = XLSX.read(data, {type: 'array'});
+                    const firstSheetName = workbook.SheetNames[0];
+                    const worksheet = workbook.Sheets[firstSheetName];
+                    const jsonData = XLSX.utils.sheet_to_json(worksheet, {header: 1, defval: ""});
+                    
+                    if (jsonData.length < 2) throw new Error("檔案內容過少");
+                    const headers = jsonData[0]; 
+                    let updatedCount = 0;
+
+                    for (let i = 1; i < jsonData.length; i++) {
+                        const row = jsonData[i];
+                        let dateVal = row[0];
+                        let dateStr = "";
+                        if (typeof dateVal === 'number') { const jsDate = new Date(Math.round((dateVal - 25569)*86400*1000)); dateStr = jsDate.toISOString().split('T')[0]; } 
+                        else if (typeof dateVal === 'string') { const d = new Date(dateVal); if (!isNaN(d.getTime())) dateStr = d.toISOString().split('T')[0]; }
+
+                        if (dateStr) {
+                            if (!rosterData[dateStr]) rosterData[dateStr] = {};
+                            for (let c = 1; c < row.length; c++) {
+                                const code = headers[c];
+                                const name = row[c];
+                                if (code && name) rosterData[dateStr][code.trim()] = name.toString().trim();
+                            }
+                            updatedCount++;
+                        }
+                    }
+
+                    localStorage.setItem(STORE_KEY_ROSTER, JSON.stringify(rosterData));
+                    document.getElementById('upload-status').textContent = `成功！更新 ${updatedCount} 筆資料。`;
+                    renderDashboard();
+
+                    if(window.isCloudActive) {
+                        window.cloudDB.saveRoster(rosterData);
+                    } else {
+                        alert(`已匯入本機。雲端未啟用。`);
+                    }
+
+                } catch (err) {
+                    console.error(err);
+                    document.getElementById('upload-status').textContent = "失敗：格式錯誤";
+                }
+            };
+            reader.readAsArrayBuffer(file);
+        }
+
+        function downloadTemplate() {
+            const allCodes = new Set();
+            Object.values(appConfig.mapping).forEach(val => {
+                if(!val) return;
+                val.split(/[,，]/).forEach(c => { const trimmed = c.trim(); if(trimmed) allCodes.add(trimmed); });
+            });
+            const header = ["Date", ...Array.from(allCodes)].join(",");
+            const tomorrow = new Date(); tomorrow.setDate(tomorrow.getDate() + 1);
+            const dateStr = tomorrow.toISOString().split('T')[0];
+            const sampleRow = [dateStr, ...Array(allCodes.size).fill("人員姓名")].join(",");
+            const csvContent = "\uFEFF" + header + "\n" + sampleRow;
+            const blob = new Blob([csvContent], { type: 'text/csv;charset=utf-8;' });
+            const url = URL.createObjectURL(blob);
+            const link = document.createElement("a");
+            link.href = url;
+            link.download = "排班匯入範本.csv";
+            document.body.appendChild(link);
+            link.click();
+            document.body.removeChild(link);
+        }
+    </script>
+</body>
+</html>
