@@ -20,7 +20,7 @@
         import { getFirestore, doc, getDoc, setDoc, onSnapshot } from "https://www.gstatic.com/firebasejs/10.8.0/firebase-firestore.js";
 
         // ==========================================
-        // ★★★ Firebase 設定已更新 ★★★
+        // ★★★ Firebase 設定 ★★★
         // ==========================================
         const firebaseConfig = {
             apiKey: "AIzaSyA2Q16Y2sHSY1rB9xwraIJAj7Uzp9_2QBM",
@@ -38,25 +38,21 @@
         let isCloudActive = false;
 
         try {
-            // Check if config is filled (It is now!)
             if (firebaseConfig.projectId !== "您的專案ID") {
                 const app = initializeApp(firebaseConfig);
                 db = getFirestore(app);
                 isCloudActive = true;
                 console.log("Firebase Connected successfully!");
                 
-                // Expose specific functions to window for the legacy code to use
                 window.cloudDB = {
                     saveConfig: async (data) => {
                         try {
-                            // Only save if data is valid
                             if(!data) return;
                             await setDoc(doc(db, "dashboard", "config"), data);
-                            // alert("雲端儲存成功！所有看板將自動更新。"); // Optional: Remove alert to be less annoying on auto-save
                             console.log("Config saved to cloud");
                         } catch (e) {
                             console.error("Save Config Error:", e);
-                            alert("雲端儲存失敗 (可能是權限問題，請確認 Firestore 規則): " + e.message);
+                            alert("雲端儲存失敗: " + e.message);
                         }
                     },
                     saveRoster: async (data) => {
@@ -69,40 +65,38 @@
                             alert("排班上傳失敗: " + e.message);
                         }
                     },
-                    listenToChanges: (onConfigUpdate, onRosterUpdate) => {
-                        // Real-time listener for Config
-                        onSnapshot(doc(db, "dashboard", "config"), (doc) => {
-                            if(doc.exists()) {
-                                const data = doc.data();
+                    listenToChanges: (onConfigUpdate, onRosterUpdate, currentLocalConfig) => {
+                        // 1. Config Listener
+                        onSnapshot(doc(db, "dashboard", "config"), (docSnapshot) => {
+                            if(docSnapshot.exists()) {
+                                const data = docSnapshot.data();
                                 console.log("Received Config update from cloud");
                                 onConfigUpdate(data);
                             } else {
-                                console.log("No config found in cloud yet.");
+                                console.log("No config found in cloud. Uploading local defaults...");
+                                // Auto-initialize cloud if empty
+                                if(currentLocalConfig) {
+                                    setDoc(doc(db, "dashboard", "config"), currentLocalConfig);
+                                }
                             }
-                        }, (error) => {
-                            console.error("Listen Config Error:", error);
-                        });
+                        }, (error) => console.error("Listen Config Error:", error));
 
-                        // Real-time listener for Roster
-                        onSnapshot(doc(db, "dashboard", "roster"), (doc) => {
-                            if(doc.exists()) {
-                                const raw = doc.data().data;
+                        // 2. Roster Listener
+                        onSnapshot(doc(db, "dashboard", "roster"), (docSnapshot) => {
+                            if(docSnapshot.exists()) {
+                                const raw = docSnapshot.data().data;
                                 if(raw) {
                                     console.log("Received Roster update from cloud");
                                     onRosterUpdate(JSON.parse(raw));
                                 }
                             }
-                        }, (error) => {
-                             console.error("Listen Roster Error:", error);
-                        });
+                        }, (error) => console.error("Listen Roster Error:", error));
                     }
                 };
-            } else {
-                console.warn("Firebase Config appears to be placeholder. Running in LocalStorage mode.");
             }
         } catch (e) {
             console.error("Firebase Init Error:", e);
-            alert("Firebase 連線初始化失敗，將切換回單機模式。\n錯誤: " + e.message);
+            alert("Firebase 初始化失敗: " + e.message);
         }
 
         window.isCloudActive = isCloudActive;
@@ -191,6 +185,21 @@
             border-radius: 6px;
             cursor: pointer;
             font-size: 1.25rem;
+        }
+
+        /* Scrollbar for admin panel */
+        .custom-scrollbar::-webkit-scrollbar {
+            width: 8px;
+        }
+        .custom-scrollbar::-webkit-scrollbar-track {
+            background: #f1f1f1; 
+        }
+        .custom-scrollbar::-webkit-scrollbar-thumb {
+            background: #888; 
+            border-radius: 4px;
+        }
+        .custom-scrollbar::-webkit-scrollbar-thumb:hover {
+            background: #555; 
         }
         
         @media print {
@@ -383,15 +392,16 @@
                     <div id="admin-image-list" class="mt-4 space-y-2 max-h-40 overflow-y-auto"></div>
                 </div>
 
-                <!-- 3. Role Mapping -->
+                <!-- 3. Role Mapping (FIXED: Using DIV structure instead of Table) -->
                 <div class="bg-white rounded-lg p-6 shadow-lg border-t-4 border-purple-500 lg:col-span-1">
                     <h3 class="text-xl font-bold mb-4 text-gray-800 pb-2">3. 崗位代號映射</h3>
                     <p class="text-xs text-gray-500 mb-2">多人請用逗號分隔 (例: A1, A2)</p>
-                    <div class="overflow-y-auto max-h-[60vh] pr-2 custom-scrollbar">
-                        <table class="w-full text-sm border-collapse">
-                            <tbody id="mapping-body" class="space-y-4 block"></tbody>
-                        </table>
+                    
+                    <!-- REPLACED TABLE WITH DIV STRUCTURE FOR STABILITY -->
+                    <div id="mapping-container" class="overflow-y-auto max-h-[60vh] pr-2 custom-scrollbar space-y-4">
+                        <!-- JS generated list -->
                     </div>
+
                     <button onclick="saveMappingConfig()" class="w-full mt-4 bg-purple-600 hover:bg-purple-700 text-white py-2 rounded-lg font-bold shadow transition"><i class="fas fa-sync-alt mr-2"></i>更新並同步</button>
                 </div>
             </div>
@@ -467,11 +477,12 @@
                     indicator.textContent = "雲端同步中";
                     indicator.className = "text-xs bg-green-600 text-white px-2 py-1 rounded";
                     
-                    // Listen for changes
+                    // Listen for changes and provide current local config for fallback init
                     window.cloudDB.listenToChanges(
                         (newConfig) => {
                             console.log("Got new Config from cloud");
-                            appConfig = { ...defaultConfig, ...newConfig };
+                            // Safety merge in case cloud config is partial
+                            appConfig = { ...defaultConfig, ...newConfig, mapping: { ...defaultConfig.mapping, ...(newConfig.mapping || {}) } };
                             localStorage.setItem(STORE_KEY_CONFIG, JSON.stringify(appConfig));
                             initUI(); // refresh admin ui
                             renderDashboard();
@@ -481,7 +492,8 @@
                             rosterData = newRoster;
                             localStorage.setItem(STORE_KEY_ROSTER, JSON.stringify(rosterData));
                             renderDashboard();
-                        }
+                        },
+                        appConfig // Pass current config to help initialize if cloud is empty
                     );
                 } else {
                     // Fallback to local
@@ -516,6 +528,7 @@
         }
 
         function initUI() {
+            // 1. Dashboard Table
             const tbody = document.getElementById('roster-body');
             tbody.innerHTML = '';
             tasks.forEach(task => {
@@ -529,30 +542,54 @@
                 tbody.appendChild(tr);
             });
 
-            const mapBody = document.getElementById('mapping-body');
-            mapBody.innerHTML = '';
+            // 2. Admin Mapping - FIXED: Using DIVs instead of potentially buggy Table
+            const mapContainer = document.getElementById('mapping-container');
+            mapContainer.innerHTML = '';
+            
+            // Safety check for mapping object
+            if(!appConfig.mapping) appConfig.mapping = {...defaultConfig.mapping};
+
             tasks.forEach(task => {
-                const row = document.createElement('tr');
-                row.className = "border-b pb-4 mb-4 block";
-                row.innerHTML = `
-                    <td class="block font-bold text-gray-700 mb-1"><i class="fas ${task.icon} mr-1"></i>${task.name}</td>
-                    <td class="grid grid-cols-3 gap-2">
-                        <input type="text" id="map-day_${task.id}" class="border rounded px-2 py-1 text-sm border-blue-300 focus:ring-2 focus:ring-blue-500 outline-none" placeholder="日班代號" value="${appConfig.mapping['day_' + task.id] || ''}">
-                        <input type="text" id="map-eve_${task.id}" class="border rounded px-2 py-1 text-sm border-indigo-300 focus:ring-2 focus:ring-indigo-500 outline-none" placeholder="小夜代號" value="${appConfig.mapping['eve_' + task.id] || ''}">
-                        <input type="text" id="map-night_${task.id}" class="border rounded px-2 py-1 text-sm border-purple-300 focus:ring-2 focus:ring-purple-500 outline-none" placeholder="大夜代號" value="${appConfig.mapping['night_' + task.id] || ''}">
-                    </td>
+                const card = document.createElement('div');
+                card.className = "bg-gray-50 p-3 rounded border border-gray-200";
+                
+                const safeGet = (key) => (appConfig.mapping && appConfig.mapping[key]) ? appConfig.mapping[key] : '';
+
+                card.innerHTML = `
+                    <div class="font-bold text-gray-800 mb-2 flex items-center">
+                        <i class="fas ${task.icon} w-6 text-center text-blue-600 mr-2"></i>
+                        ${task.name}
+                    </div>
+                    <div class="grid grid-cols-1 gap-2">
+                        <div class="flex items-center">
+                            <span class="w-12 text-xs font-bold text-gray-500">日班</span>
+                            <input type="text" id="map-day_${task.id}" class="flex-1 border rounded px-2 py-1 text-sm border-gray-300 focus:ring-2 focus:ring-blue-500 outline-none" placeholder="代號" value="${safeGet('day_' + task.id)}">
+                        </div>
+                        <div class="flex items-center">
+                            <span class="w-12 text-xs font-bold text-gray-500">小夜</span>
+                            <input type="text" id="map-eve_${task.id}" class="flex-1 border rounded px-2 py-1 text-sm border-gray-300 focus:ring-2 focus:ring-blue-500 outline-none" placeholder="代號" value="${safeGet('eve_' + task.id)}">
+                        </div>
+                        <div class="flex items-center">
+                            <span class="w-12 text-xs font-bold text-gray-500">大夜</span>
+                            <input type="text" id="map-night_${task.id}" class="flex-1 border rounded px-2 py-1 text-sm border-gray-300 focus:ring-2 focus:ring-blue-500 outline-none" placeholder="代號" value="${safeGet('night_' + task.id)}">
+                        </div>
+                    </div>
                 `;
-                mapBody.appendChild(row);
+                mapContainer.appendChild(card);
             });
 
-            document.getElementById('config-title').value = appConfig.title;
-            document.getElementById('config-manager').value = appConfig.manager;
-            document.getElementById('config-agent').value = appConfig.agent;
-            document.getElementById('config-phone').value = appConfig.phone;
-            document.getElementById('config-valuable').value = appConfig.assets.valuable || '';
-            document.getElementById('config-hazard').value = appConfig.assets.hazard || '';
-            document.getElementById('config-equipment').value = appConfig.assets.equipment || '';
-            document.getElementById('config-remarks').value = appConfig.assets.remarks || '';
+            // 3. Fill Forms
+            document.getElementById('config-title').value = appConfig.title || '';
+            document.getElementById('config-manager').value = appConfig.manager || '';
+            document.getElementById('config-agent').value = appConfig.agent || '';
+            document.getElementById('config-phone').value = appConfig.phone || '';
+            
+            if(appConfig.assets) {
+                document.getElementById('config-valuable').value = appConfig.assets.valuable || '';
+                document.getElementById('config-hazard').value = appConfig.assets.hazard || '';
+                document.getElementById('config-equipment').value = appConfig.assets.equipment || '';
+                document.getElementById('config-remarks').value = appConfig.assets.remarks || '';
+            }
             
             renderAdminImages();
         }
@@ -560,17 +597,23 @@
         function renderDashboard() {
             const selectedDate = document.getElementById('date-picker').value;
             
-            document.getElementById('display-title').textContent = appConfig.title;
-            document.getElementById('display-manager').textContent = appConfig.manager;
-            document.getElementById('display-agent').textContent = appConfig.agent;
-            document.getElementById('display-phone').textContent = appConfig.phone;
-            document.getElementById('display-assets-valuable').textContent = appConfig.assets.valuable || '(未設定)';
-            document.getElementById('display-assets-hazard').textContent = appConfig.assets.hazard || '(未設定)';
-            document.getElementById('display-assets-equipment').textContent = appConfig.assets.equipment || '(未設定)';
-            document.getElementById('display-assets-remarks').textContent = appConfig.assets.remarks || '(未設定)';
+            document.getElementById('display-title').textContent = appConfig.title || '';
+            document.getElementById('display-manager').textContent = appConfig.manager || '';
+            document.getElementById('display-agent').textContent = appConfig.agent || '';
+            document.getElementById('display-phone').textContent = appConfig.phone || '';
+            
+            if(appConfig.assets) {
+                document.getElementById('display-assets-valuable').textContent = appConfig.assets.valuable || '(未設定)';
+                document.getElementById('display-assets-hazard').textContent = appConfig.assets.hazard || '(未設定)';
+                document.getElementById('display-assets-equipment').textContent = appConfig.assets.equipment || '(未設定)';
+                document.getElementById('display-assets-remarks').textContent = appConfig.assets.remarks || '(未設定)';
+            }
 
             const todaysData = rosterData[selectedDate] || {};
             
+            // Safety check
+            if(!appConfig.mapping) appConfig.mapping = {};
+
             for (const [uiKey, excelCodeString] of Object.entries(appConfig.mapping)) {
                 const cellId = `view-${uiKey}`;
                 const cell = document.getElementById(cellId);
@@ -616,12 +659,11 @@
             const reader = new FileReader();
             reader.onload = function(e) {
                 const base64 = e.target.result;
+                if(!appConfig.images) appConfig.images = [];
                 appConfig.images.push(base64);
-                // Save locally first to feel instant
                 localStorage.setItem(STORE_KEY_CONFIG, JSON.stringify(appConfig));
                 renderDashboard();
                 renderAdminImages();
-                // Then try sync
                 if(window.isCloudActive) window.cloudDB.saveConfig(appConfig);
             };
             reader.readAsDataURL(file);
@@ -715,6 +757,7 @@
             const inputs = document.querySelectorAll('input[id^="map-"]');
             inputs.forEach(input => {
                 const key = input.id.replace('map-', '');
+                if(!appConfig.mapping) appConfig.mapping = {};
                 appConfig.mapping[key] = input.value.trim();
             });
             localStorage.setItem(STORE_KEY_CONFIG, JSON.stringify(appConfig));
@@ -785,10 +828,12 @@
 
         function downloadTemplate() {
             const allCodes = new Set();
-            Object.values(appConfig.mapping).forEach(val => {
-                if(!val) return;
-                val.split(/[,，]/).forEach(c => { const trimmed = c.trim(); if(trimmed) allCodes.add(trimmed); });
-            });
+            if(appConfig.mapping) {
+                Object.values(appConfig.mapping).forEach(val => {
+                    if(!val) return;
+                    val.split(/[,，]/).forEach(c => { const trimmed = c.trim(); if(trimmed) allCodes.add(trimmed); });
+                });
+            }
             const header = ["Date", ...Array.from(allCodes)].join(",");
             const tomorrow = new Date(); tomorrow.setDate(tomorrow.getDate() + 1);
             const dateStr = tomorrow.toISOString().split('T')[0];
