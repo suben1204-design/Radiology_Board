@@ -17,7 +17,7 @@
     <!-- Firebase SDKs (Modular) -->
     <script type="module">
         import { initializeApp } from "https://www.gstatic.com/firebasejs/10.8.0/firebase-app.js";
-        import { getFirestore, doc, getDoc, setDoc, onSnapshot } from "https://www.gstatic.com/firebasejs/10.8.0/firebase-firestore.js";
+        import { initializeFirestore, doc, getDoc, setDoc, onSnapshot } from "https://www.gstatic.com/firebasejs/10.8.0/firebase-firestore.js";
 
         // ==========================================
         // ★★★ Firebase 設定 ★★★
@@ -40,15 +40,18 @@
         try {
             if (firebaseConfig.projectId !== "您的專案ID") {
                 const app = initializeApp(firebaseConfig);
-                db = getFirestore(app);
+                // 自動偵測長輪詢，避免醫院內網或防火牆阻擋 WebSocket/WebChannel 造成斷線
+                db = initializeFirestore(app, {
+                    experimentalAutoDetectLongPolling: true
+                });
                 isCloudActive = true;
                 console.log("Firebase Connected successfully!");
                 
                 window.cloudDB = {
                     saveConfig: async (data) => {
                         try {
-                            if(!data) return;
-                            await setDoc(doc(db, "dashboard", "config"), data);
+                            if(!data || Object.keys(data).length === 0) return;
+                            await setDoc(doc(db, "dashboard", "config"), data, { merge: true });
                             console.log("Config saved to cloud");
                         } catch (e) {
                             console.error("Save Config Error:", e);
@@ -58,7 +61,21 @@
                     saveRoster: async (data) => {
                         try {
                             if(!data) return;
-                            await setDoc(doc(db, "dashboard", "roster"), { data: JSON.stringify(data) }); 
+                            // 先讀取雲端現有排班並合併，避免單機尚未載入完就覆蓋雲端舊資料
+                            let merged = { ...data };
+                            try {
+                                const existingSnap = await getDoc(doc(db, "dashboard", "roster"));
+                                if (existingSnap.exists() && existingSnap.data().data) {
+                                    const cloudData = JSON.parse(existingSnap.data().data);
+                                    merged = { ...cloudData, ...data };
+                                }
+                            } catch (readErr) {
+                                console.warn("Read before merge skipped:", readErr);
+                            }
+                            await setDoc(doc(db, "dashboard", "roster"), {
+                                data: JSON.stringify(merged),
+                                updatedAt: new Date().toISOString()
+                            }); 
                             alert("排班表已同步至雲端！");
                         } catch (e) {
                             console.error("Save Roster Error:", e);
@@ -68,15 +85,14 @@
                     listenToChanges: (onConfigUpdate, onRosterUpdate, currentLocalConfig) => {
                         // 1. Config Listener
                         onSnapshot(doc(db, "dashboard", "config"), (docSnapshot) => {
-                            if(docSnapshot.exists()) {
+                            if(docSnapshot.exists() && Object.keys(docSnapshot.data() || {}).length > 0) {
                                 const data = docSnapshot.data();
                                 console.log("Received Config update from cloud");
                                 onConfigUpdate(data);
                             } else {
-                                console.log("No config found in cloud. Uploading local defaults...");
-                                // Auto-initialize cloud if empty
-                                if(currentLocalConfig) {
-                                    setDoc(doc(db, "dashboard", "config"), currentLocalConfig);
+                                console.log("No valid config found in cloud. Uploading local defaults...");
+                                if(currentLocalConfig && Object.keys(currentLocalConfig).length > 0) {
+                                    setDoc(doc(db, "dashboard", "config"), currentLocalConfig, { merge: true });
                                 }
                             }
                         }, (error) => console.error("Listen Config Error:", error));
@@ -100,6 +116,7 @@
         }
 
         window.isCloudActive = isCloudActive;
+        window.dispatchEvent(new Event('firebase-ready'));
     </script>
 
     <style>
@@ -462,50 +479,62 @@
         let rosterData = {};
 
         // ================= INITIALIZATION =================
-        document.addEventListener('DOMContentLoaded', () => {
-            // Check cloud
-            setTimeout(() => {
-                if (window.isCloudActive && window.cloudDB) {
-                    const status = document.getElementById('cloud-status');
-                    const text = document.getElementById('cloud-status-text');
-                    const indicator = document.getElementById('cloud-indicator');
-                    
-                    status.classList.remove('hidden');
-                    status.className = "bg-green-700 text-white text-xs text-center p-1";
-                    text.innerHTML = '<i class="fas fa-cloud-upload-alt mr-1"></i> 雲端同步中';
-                    
-                    indicator.textContent = "雲端同步中";
-                    indicator.className = "text-xs bg-green-600 text-white px-2 py-1 rounded";
-                    
-                    // Listen for changes and provide current local config for fallback init
-                    window.cloudDB.listenToChanges(
-                        (newConfig) => {
-                            console.log("Got new Config from cloud");
-                            // Safety merge in case cloud config is partial
-                            appConfig = { ...defaultConfig, ...newConfig, mapping: { ...defaultConfig.mapping, ...(newConfig.mapping || {}) } };
-                            localStorage.setItem(STORE_KEY_CONFIG, JSON.stringify(appConfig));
-                            initUI(); // refresh admin ui
-                            renderDashboard();
-                        },
-                        (newRoster) => {
-                            console.log("Got new Roster from cloud");
-                            rosterData = newRoster;
-                            localStorage.setItem(STORE_KEY_ROSTER, JSON.stringify(rosterData));
-                            renderDashboard();
-                        },
-                        appConfig // Pass current config to help initialize if cloud is empty
-                    );
-                } else {
-                    // Fallback to local
-                    loadDataLocal();
-                    initUI();
-                    renderDashboard();
-                    renderAdminImages();
-                }
-            }, 1000); // Wait for module to load
+        let cloudSyncStarted = false;
+        function startCloudSync() {
+            if (cloudSyncStarted) return;
+            if (window.isCloudActive && window.cloudDB) {
+                cloudSyncStarted = true;
+                const status = document.getElementById('cloud-status');
+                const text = document.getElementById('cloud-status-text');
+                const indicator = document.getElementById('cloud-indicator');
+                
+                status.classList.remove('hidden');
+                status.className = "bg-green-700 text-white text-xs text-center p-1";
+                text.innerHTML = '<i class="fas fa-cloud-upload-alt mr-1"></i> 雲端同步中';
+                
+                indicator.textContent = "雲端同步中";
+                indicator.className = "text-xs bg-green-600 text-white px-2 py-1 rounded";
+                
+                window.cloudDB.listenToChanges(
+                    (newConfig) => {
+                        console.log("Got new Config from cloud");
+                        appConfig = {
+                            ...defaultConfig,
+                            ...newConfig,
+                            assets: { ...defaultConfig.assets, ...(newConfig.assets || {}) },
+                            mapping: { ...defaultConfig.mapping, ...(newConfig.mapping || {}) }
+                        };
+                        localStorage.setItem(STORE_KEY_CONFIG, JSON.stringify(appConfig));
+                        initUI();
+                        renderDashboard();
+                    },
+                    (newRoster) => {
+                        console.log("Got new Roster from cloud");
+                        rosterData = { ...rosterData, ...newRoster };
+                        localStorage.setItem(STORE_KEY_ROSTER, JSON.stringify(rosterData));
+                        renderDashboard();
+                    },
+                    appConfig
+                );
+            }
+        }
 
+        document.addEventListener('DOMContentLoaded', () => {
             const today = new Date().toISOString().split('T')[0];
             document.getElementById('date-picker').value = today;
+
+            // 先載入本機預設/快取資料，避免雲端尚未連線完成時 appConfig 為空物件 {}
+            loadDataLocal();
+            initUI();
+            renderDashboard();
+            renderAdminImages();
+
+            // 若 Firebase 模組已就緒則立即連線，否則監聽 firebase-ready 事件（不再受限於 1 秒超時斷線）
+            if (window.isCloudActive && window.cloudDB) {
+                startCloudSync();
+            } else {
+                window.addEventListener('firebase-ready', startCloudSync);
+            }
         });
 
         function loadDataLocal() {
