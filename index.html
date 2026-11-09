@@ -17,7 +17,7 @@
     <!-- Firebase SDKs (Modular) -->
     <script type="module">
         import { initializeApp } from "https://www.gstatic.com/firebasejs/10.8.0/firebase-app.js";
-        import { initializeFirestore, doc, getDoc, setDoc, onSnapshot } from "https://www.gstatic.com/firebasejs/10.8.0/firebase-firestore.js";
+        import { initializeFirestore, doc, getDoc, setDoc, deleteDoc, deleteField, onSnapshot } from "https://www.gstatic.com/firebasejs/10.8.0/firebase-firestore.js";
 
         // ==========================================
         // ★★★ Firebase 設定 ★★★
@@ -36,6 +36,7 @@
         // Initialize Firebase
         let db;
         let isCloudActive = false;
+        const CHUNK_SIZE = 200000; // 200 KB per Firestore document chunk (解除單一文件 1MB 限制)
 
         try {
             if (firebaseConfig.projectId !== "您的專案ID") {
@@ -51,12 +52,52 @@
                     saveConfig: async (data) => {
                         try {
                             if(!data || Object.keys(data).length === 0) return;
-                            await setDoc(doc(db, "dashboard", "config"), data, { merge: true });
-                            console.log("Config saved to cloud");
+                            // 剔除龐大的原始 Base64 images 陣列，圖片改由獨立分片文件與 imageMeta 管理
+                            const payload = { ...data, images: deleteField() };
+                            await setDoc(doc(db, "dashboard", "config"), payload, { merge: true });
+                            console.log("Config saved to cloud (lightweight)");
                         } catch (e) {
                             console.error("Save Config Error:", e);
                             alert("雲端儲存失敗: " + e.message);
                         }
+                    },
+                    saveImageChunked: async (imgId, title, base64DataUrl) => {
+                        const chunks = [];
+                        for (let i = 0; i < base64DataUrl.length; i += CHUNK_SIZE) {
+                            chunks.push(base64DataUrl.slice(i, i + CHUNK_SIZE));
+                        }
+                        await Promise.all(chunks.map((chunkStr, idx) =>
+                            setDoc(doc(db, "dashboard", `img_${imgId}_${idx}`), {
+                                imageId: imgId,
+                                index: idx,
+                                data: chunkStr,
+                                updatedAt: new Date().toISOString()
+                            })
+                        ));
+                        return { id: imgId, title: title || "防災平面圖", chunks: chunks.length };
+                    },
+                    deleteImageChunks: async (metaItem) => {
+                        if (!metaItem || !metaItem.id) return;
+                        const count = Number(metaItem.chunks || 1);
+                        const tasks = [];
+                        for (let i = 0; i < count; i++) {
+                            tasks.push(deleteDoc(doc(db, "dashboard", `img_${metaItem.id}_${i}`)).catch(() => {}));
+                        }
+                        await Promise.all(tasks);
+                    },
+                    loadImagesFromMeta: async (imageMeta) => {
+                        if (!Array.isArray(imageMeta) || imageMeta.length === 0) return [];
+                        const results = await Promise.all(imageMeta.map(async (item) => {
+                            const count = Number(item.chunks || 1);
+                            const partPromises = [];
+                            for (let i = 0; i < count; i++) {
+                                partPromises.push(getDoc(doc(db, "dashboard", `img_${item.id}_${i}`)));
+                            }
+                            const snaps = await Promise.all(partPromises);
+                            const joined = snaps.map(s => (s.exists() && s.data().data) ? s.data().data : "").join("");
+                            return joined ? { id: item.id, title: item.title || "", src: joined, chunks: count } : null;
+                        }));
+                        return results.filter(Boolean);
                     },
                     saveRoster: async (data) => {
                         try {
@@ -92,7 +133,9 @@
                             } else {
                                 console.log("No valid config found in cloud. Uploading local defaults...");
                                 if(currentLocalConfig && Object.keys(currentLocalConfig).length > 0) {
-                                    setDoc(doc(db, "dashboard", "config"), currentLocalConfig, { merge: true });
+                                    const payload = { ...currentLocalConfig };
+                                    delete payload.images;
+                                    setDoc(doc(db, "dashboard", "config"), payload, { merge: true });
                                 }
                             }
                         }, (error) => console.error("Listen Config Error:", error));
@@ -400,7 +443,7 @@
                     <button onclick="downloadTemplate()" class="mt-4 w-full bg-gray-600 hover:bg-gray-700 text-white py-2 rounded font-bold text-sm shadow"><i class="fas fa-download mr-2"></i>下載範本</button>
                     <hr class="my-6 border-gray-300">
                     <h3 class="text-xl font-bold mb-4 text-gray-800 pb-2">4. 平面圖管理</h3>
-                    <div class="bg-yellow-50 p-2 rounded text-xs text-yellow-800 mb-2 border border-yellow-200"><i class="fas fa-exclamation-triangle mr-1"></i>圖片請勿過大 (>500KB)，以免同步失敗。</div>
+                    <div class="bg-blue-50 p-2 rounded text-xs text-blue-800 mb-2 border border-blue-200"><i class="fas fa-check-circle mr-1"></i>已啟用雲端自動分片儲存，支援高解析度多張圖資同步。</div>
                     <div class="flex gap-2">
                         <input type="file" id="image-upload" accept="image/*" class="hidden" onchange="handleImageUpload(this)">
                         <button onclick="document.getElementById('image-upload').click()" class="flex-1 bg-yellow-600 hover:bg-yellow-700 text-white py-2 rounded font-bold text-sm shadow"><i class="fas fa-image mr-2"></i>新增圖片</button>
@@ -438,20 +481,36 @@
 
         const defaultConfig = {
             title: "臺中市立老人復健綜合醫院 (委託財團法人中國醫藥大學興建經營)\n醫學影像科 自衛消防編組任務表",
-            manager: "蘇峯毅",
-            agent: "值班主治醫師",
-            phone: "3333",
+            manager: "蘇峰毅",
+            agent: "謝佑忠",
+            phone: "緊急應變中心 (11119、11110)",
             assets: {
-                valuable: "1. MRI磁振造影儀\n2. CT電腦斷層掃描儀\n3. 血管攝影機",
-                hazard: "1. 顯影劑 (庫房A)\n2. 放射性同位素 (管制區)",
-                equipment: "1. 滅火器 (各檢查室門口)\n2. 消防栓 (走廊兩側)",
-                remarks: "如遇緊急狀況，請優先引導病患至安全區域。"
+                valuable: "1.\t核磁共振掃瞄儀2部\n2.\t電腦斷層掃瞄儀2部\n3.\t血管透視攝影機1部\n4.\t數位Ｘ光機3部\n5.\t超音波1部\n6.\t乳房攝影機1部\n7.\t骨質密度儀1部\n8.\t移動式X光機",
+                hazard: "1.\t酒精95%\n2.\t酒精75%\n3.\t乾洗液75%\n4.\t３Ｍ乾式刷手液\n5.\t福馬林\n6.\t克茵寧殺茵液２％\n7.\t金碘藥水\n8.\t金碘酒精液\n9.\t速安高效殺茵液\n10.\t白凡士林\n11.\t酵素清潔液\n12.\t氧氣",
+                equipment: "1.\t乾粉滅火器11支\n2.\t環保氣體滅火器4支\n3.\tCO2滅火器10支\n4.\t消防警鈴-(工作站電腦旁邊)\n5.\t消防警鈴-(MRI門口消防警鈴)\n6.\t消防栓-(Sono檢查室左邊轉彎處)\n7.\t消防栓-(BMD門口右邊牆上) ",
+                remarks: "如遇緊急狀況，請優先引導病患至安全區域。\n自衛消防編組任務\n(一)、滅火班：發現火災及聽到呼救距離最近的同仁，就近以滅火器及室內消防栓進行初期滅火，以撲滅火苗防止火勢擴大延燒，待滅火單位接手後配合防火員指揮。\n(二)、通報班：按壓消防栓上之火警警報器，啟動單位「自衛消防編組」，通報緊急應變中心 (11119、11110)及影響樓層，並隨時收集現場資料向指揮中心報告。\n(三)、安全防護班：進行防火區域隔離(關閉安全門)，啟動防煙、排煙設備；關閉空調，確認無使用O2/Air/Suction後關閉總閥；移除危險物品(如易燃、爆裂物等)，協同工務組關閉醫療儀器及電氣設備，配合防火員確認無人後關燈撤離。\n(四)、避難引導班：開啟緊急出口門，移除障礙物，並確認逃生路徑安全，於轉角、出入口安排避難引導人員駐點，指揮棒開燈、吹哨進行避難引導，安撫現場人員並提醒逃生姿勢，如有必要時協助操作逃生器具，配合防火員確認現場無人後離開至集結地報到。\n(五)、救護班：對病患、家屬及受傷者提供緊急運送及醫療協助，依需求配合棟長成立救護站，提供救護服務，掌握現場醫療狀況，隨時回報棟長即時資訊。"
             },
             mapping: {
-                "day_leader": "MR-1", "day_notify": "CT-1", "day_extinguish": "XR-1, XR-2", "day_evacuate": "US-1, US-2", "day_rescue": "NM-1", "day_medical": "ANGIO-1",
-                "eve_leader": "ER-E-Leader", "eve_notify": "ER-E-1", "eve_extinguish": "ER-E-2", "eve_evacuate": "ER-E-3", "eve_rescue": "ER-E-4", "eve_medical": "ER-E-5",
-                "night_leader": "ER-N-Leader", "night_notify": "ER-N-1", "night_extinguish": "ER-N-2", "night_evacuate": "ER-N-3", "night_rescue": "ER-N-4", "night_medical": "ER-N-5"
+                "day_leader": "放射師主管, MR-1",
+                "day_notify": "MP, 3C-R(3), MR-1",
+                "day_extinguish": "R(1), MAMMO(1) , MR-2 , R(3)",
+                "day_evacuate": "ER-R(G), ER-CT(G) , CT1(D)",
+                "day_rescue": "DSA-1, R(2)",
+                "day_medical": "N-CT, N-MR, N-DSA , N-CT2 ,General duty, 值班VS",
+                "eve_leader": "ER-R(f)",
+                "eve_notify": "ER-R(f)",
+                "eve_extinguish": "ER-R(Y) , MR-2(PM)",
+                "eve_evacuate": "MR-1(PM)",
+                "eve_rescue": "ER-R(f)",
+                "eve_medical": "ER-R(Y), 值班VS",
+                "night_leader": "ER-R(X)",
+                "night_notify": "ER-R(X)",
+                "night_extinguish": "ER-R(X)",
+                "night_evacuate": "ER-R(X)",
+                "night_rescue": "ER-R(X)",
+                "night_medical": "ER-R(X), 值班VS"
             },
+            imageMeta: [],
             images: []
         };
 
@@ -478,6 +537,18 @@
         let appConfig = {};
         let rosterData = {};
 
+        function safeSaveLocalConfig(cfg) {
+            try {
+                // 為避免超過 localStorage 5MB 上限，本機快取優先儲存設定與圖片，若溢位則僅儲存輕量設定
+                localStorage.setItem(STORE_KEY_CONFIG, JSON.stringify(cfg));
+            } catch (e) {
+                try {
+                    const lightCfg = { ...cfg, images: [] };
+                    localStorage.setItem(STORE_KEY_CONFIG, JSON.stringify(lightCfg));
+                } catch (_) {}
+            }
+        }
+
         // ================= INITIALIZATION =================
         let cloudSyncStarted = false;
         function startCloudSync() {
@@ -496,17 +567,37 @@
                 indicator.className = "text-xs bg-green-600 text-white px-2 py-1 rounded";
                 
                 window.cloudDB.listenToChanges(
-                    (newConfig) => {
+                    async (newConfig) => {
                         console.log("Got new Config from cloud");
+                        const prevImages = appConfig.images || [];
                         appConfig = {
                             ...defaultConfig,
                             ...newConfig,
                             assets: { ...defaultConfig.assets, ...(newConfig.assets || {}) },
-                            mapping: { ...defaultConfig.mapping, ...(newConfig.mapping || {}) }
+                            mapping: { ...defaultConfig.mapping, ...(newConfig.mapping || {}) },
+                            imageMeta: Array.isArray(newConfig.imageMeta) ? newConfig.imageMeta : (appConfig.imageMeta || []),
+                            images: Array.isArray(newConfig.images) && newConfig.images.length > 0 ? newConfig.images : prevImages
                         };
-                        localStorage.setItem(STORE_KEY_CONFIG, JSON.stringify(appConfig));
                         initUI();
                         renderDashboard();
+
+                        // 若雲端有獨立分片儲存的 imageMeta，平行載入所有圖片分片並無縫拼回
+                        if (Array.isArray(newConfig.imageMeta)) {
+                            if (newConfig.imageMeta.length > 0) {
+                                try {
+                                    const loadedList = await window.cloudDB.loadImagesFromMeta(newConfig.imageMeta);
+                                    appConfig.images = loadedList.map(item => item.src);
+                                    appConfig.imageMeta = loadedList.map(item => ({ id: item.id, title: item.title, chunks: item.chunks }));
+                                } catch (imgErr) {
+                                    console.error("Load chunked images error:", imgErr);
+                                }
+                            } else {
+                                appConfig.images = [];
+                            }
+                            renderDashboard();
+                            renderAdminImages();
+                        }
+                        safeSaveLocalConfig(appConfig);
                     },
                     (newRoster) => {
                         console.log("Got new Roster from cloud");
@@ -541,10 +632,17 @@
             const savedConfig = localStorage.getItem(STORE_KEY_CONFIG);
             if (savedConfig) {
                 const parsed = JSON.parse(savedConfig);
-                appConfig = { ...defaultConfig, ...parsed, assets: { ...defaultConfig.assets, ...(parsed.assets || {}) }, images: parsed.images || [] };
+                appConfig = {
+                    ...defaultConfig,
+                    ...parsed,
+                    assets: { ...defaultConfig.assets, ...(parsed.assets || {}) },
+                    mapping: { ...defaultConfig.mapping, ...(parsed.mapping || {}) },
+                    imageMeta: parsed.imageMeta || [],
+                    images: parsed.images || []
+                };
             } else {
                 appConfig = JSON.parse(JSON.stringify(defaultConfig));
-                localStorage.setItem(STORE_KEY_CONFIG, JSON.stringify(appConfig));
+                safeSaveLocalConfig(appConfig);
             }
 
             const savedRoster = localStorage.getItem(STORE_KEY_ROSTER);
@@ -623,6 +721,57 @@
             renderAdminImages();
         }
 
+        // 智慧型排班代號解析（自動過濾 #N/A 並相容大小寫與 ER-R(Y)/ER(Y) 別名）
+        function resolvePersonName(todaysData, rawCode) {
+            if (!todaysData || !rawCode) return null;
+            const code = rawCode.trim();
+            const isValidName = (val) => {
+                if (val === undefined || val === null) return false;
+                const s = String(val).trim();
+                if (!s) return false;
+                const upper = s.toUpperCase();
+                if (upper === '#N/A' || upper === 'N/A' || upper === '#VALUE!' || upper === '#REF!' || upper === 'NULL' || s === '-' || s === '無') return false;
+                return true;
+            };
+
+            // 1. 完全一致
+            if (isValidName(todaysData[code])) return String(todaysData[code]).trim();
+
+            // 2. 常見別名轉換（例如 ER-R(Y) <-> ER(Y)）
+            const aliases = [code.toUpperCase()];
+            if (code.toUpperCase() === 'ER-R(Y)') aliases.push('ER(Y)');
+            if (code.toUpperCase() === 'ER(Y)') aliases.push('ER-R(Y)');
+
+            for (const [k, v] of Object.entries(todaysData)) {
+                if (aliases.includes(k.trim().toUpperCase()) && isValidName(v)) {
+                    return String(v).trim();
+                }
+            }
+            return null;
+        }
+
+        function openImagePreview(index) {
+            const imgData = appConfig.images && appConfig.images[index];
+            if (!imgData) return;
+            try {
+                if (imgData.startsWith('data:')) {
+                    const parts = imgData.split(',');
+                    const mime = (parts[0].match(/:(.*?);/) || [null, 'image/jpeg'])[1];
+                    const bstr = atob(parts[1]);
+                    let n = bstr.length;
+                    const u8arr = new Uint8Array(n);
+                    while (n--) u8arr[n] = bstr.charCodeAt(n);
+                    const blob = new Blob([u8arr], { type: mime });
+                    const blobUrl = URL.createObjectURL(blob);
+                    window.open(blobUrl, '_blank');
+                    return;
+                }
+            } catch (e) {
+                console.warn("Blob preview fallback:", e);
+            }
+            window.open(imgData, '_blank');
+        }
+
         function renderDashboard() {
             const selectedDate = document.getElementById('date-picker').value;
             
@@ -653,7 +802,7 @@
                     let hasPerson = false;
                     if (codes.length > 0) {
                         const names = codes.map(code => {
-                            const name = todaysData[code];
+                            const name = resolvePersonName(todaysData, code);
                             if (name) { hasPerson = true; return `<span class="person-entry">${name}</span>`; }
                             else { return `<span class="person-entry text-gray-400 text-sm italic font-normal">(${code} 缺)</span>`; }
                         });
@@ -671,29 +820,48 @@
             if (appConfig.images && appConfig.images.length > 0) {
                 section.classList.remove('hidden');
                 appConfig.images.forEach((imgData, index) => {
+                    const metaTitle = (appConfig.imageMeta && appConfig.imageMeta[index] && appConfig.imageMeta[index].title)
+                        ? appConfig.imageMeta[index].title
+                        : `圖資 ${index + 1}`;
                     const div = document.createElement('div');
-                    div.className = "bg-white p-2 rounded shadow border border-gray-300";
-                    div.innerHTML = `<img src="${imgData}" class="w-full h-auto rounded hover:scale-[1.02] transition cursor-pointer" onclick="window.open(this.src)"><div class="mt-2 text-center text-sm font-bold text-gray-600">圖資 ${index + 1}</div>`;
+                    div.className = "bg-white p-3 rounded-lg shadow border border-gray-300 flex flex-col justify-between";
+                    div.innerHTML = `<img src="${imgData}" alt="${metaTitle}" class="w-full h-auto max-h-[420px] object-contain rounded hover:scale-[1.02] transition cursor-pointer mx-auto" onclick="openImagePreview(${index})"><div class="mt-2 pt-2 border-t border-gray-100 text-center text-sm font-bold text-gray-700">${metaTitle}</div>`;
                     gallery.appendChild(div);
                 });
             } else { section.classList.add('hidden'); }
         }
 
-        // ================= IMAGE HANDLING =================
-        function handleImageUpload(input) {
+        // ================= IMAGE HANDLING (獨立分片儲存) =================
+        async function handleImageUpload(input) {
             const file = input.files[0];
             if (!file) return;
-            if (file.size > 500000) { if(!confirm("圖片較大 (>500KB)，可能會導致雲端同步變慢或失敗。建議先縮圖。確定要繼續嗎？")) return; }
+            const title = file.name.replace(/\.[^/.]+$/, "") || `圖資 ${(appConfig.images ? appConfig.images.length : 0) + 1}`;
 
             const reader = new FileReader();
-            reader.onload = function(e) {
+            reader.onload = async function(e) {
                 const base64 = e.target.result;
                 if(!appConfig.images) appConfig.images = [];
+                if(!appConfig.imageMeta) appConfig.imageMeta = [];
+
+                const imgId = 'img_' + Date.now();
                 appConfig.images.push(base64);
-                localStorage.setItem(STORE_KEY_CONFIG, JSON.stringify(appConfig));
+
+                if (window.isCloudActive && window.cloudDB) {
+                    try {
+                        const metaItem = await window.cloudDB.saveImageChunked(imgId, title, base64);
+                        appConfig.imageMeta.push(metaItem);
+                        await window.cloudDB.saveConfig(appConfig);
+                    } catch (err) {
+                        console.error("Chunked image upload failed:", err);
+                        alert("圖片雲端分片上傳失敗: " + err.message);
+                    }
+                } else {
+                    appConfig.imageMeta.push({ id: imgId, title: title, chunks: 1 });
+                }
+
+                safeSaveLocalConfig(appConfig);
                 renderDashboard();
                 renderAdminImages();
-                if(window.isCloudActive) window.cloudDB.saveConfig(appConfig);
             };
             reader.readAsDataURL(file);
             input.value = '';
@@ -704,30 +872,45 @@
             list.innerHTML = '';
             if (appConfig.images && appConfig.images.length > 0) {
                 appConfig.images.forEach((img, idx) => {
+                    const metaTitle = (appConfig.imageMeta && appConfig.imageMeta[idx] && appConfig.imageMeta[idx].title)
+                        ? appConfig.imageMeta[idx].title
+                        : `圖片 ${idx + 1}`;
                     const row = document.createElement('div');
                     row.className = "flex items-center justify-between bg-gray-100 p-2 rounded border";
-                    row.innerHTML = `<div class="flex items-center"><img src="${img}" class="w-10 h-10 object-cover rounded mr-3"><span class="text-sm font-bold text-gray-700">圖片 ${idx + 1}</span></div><button onclick="deleteImage(${idx})" class="text-red-500 hover:text-red-700 px-2 font-bold"><i class="fas fa-trash-alt"></i></button>`;
+                    row.innerHTML = `<div class="flex items-center overflow-hidden"><img src="${img}" class="w-10 h-10 object-cover rounded mr-3 flex-shrink-0"><span class="text-sm font-bold text-gray-700 truncate">${metaTitle}</span></div><button onclick="deleteImage(${idx})" class="text-red-500 hover:text-red-700 px-2 font-bold flex-shrink-0"><i class="fas fa-trash-alt"></i></button>`;
                     list.appendChild(row);
                 });
             } else { list.innerHTML = '<div class="text-gray-400 text-sm text-center">目前無圖片</div>'; }
         }
 
-        function deleteImage(index) {
+        async function deleteImage(index) {
             if(confirm('確定要刪除這張圖片嗎？')) {
+                const removedMeta = (appConfig.imageMeta && appConfig.imageMeta[index]) ? appConfig.imageMeta[index] : null;
                 appConfig.images.splice(index, 1);
-                localStorage.setItem(STORE_KEY_CONFIG, JSON.stringify(appConfig));
+                if (appConfig.imageMeta) appConfig.imageMeta.splice(index, 1);
+                safeSaveLocalConfig(appConfig);
                 renderDashboard();
                 renderAdminImages();
-                if(window.isCloudActive) window.cloudDB.saveConfig(appConfig);
+                if(window.isCloudActive && window.cloudDB) {
+                    if (removedMeta) await window.cloudDB.deleteImageChunks(removedMeta);
+                    await window.cloudDB.saveConfig(appConfig);
+                }
             }
         }
-        function clearAllImages() {
+        async function clearAllImages() {
             if(confirm('確定要清空所有圖片嗎？')) {
+                const oldMeta = appConfig.imageMeta ? [...appConfig.imageMeta] : [];
                 appConfig.images = [];
-                localStorage.setItem(STORE_KEY_CONFIG, JSON.stringify(appConfig));
+                appConfig.imageMeta = [];
+                safeSaveLocalConfig(appConfig);
                 renderDashboard();
                 renderAdminImages();
-                if(window.isCloudActive) window.cloudDB.saveConfig(appConfig);
+                if(window.isCloudActive && window.cloudDB) {
+                    for (const item of oldMeta) {
+                        await window.cloudDB.deleteImageChunks(item);
+                    }
+                    await window.cloudDB.saveConfig(appConfig);
+                }
             }
         }
 
@@ -772,7 +955,7 @@
             appConfig.assets.equipment = document.getElementById('config-equipment').value;
             appConfig.assets.remarks = document.getElementById('config-remarks').value;
 
-            localStorage.setItem(STORE_KEY_CONFIG, JSON.stringify(appConfig));
+            safeSaveLocalConfig(appConfig);
             renderDashboard();
 
             if(window.isCloudActive) {
@@ -789,7 +972,7 @@
                 if(!appConfig.mapping) appConfig.mapping = {};
                 appConfig.mapping[key] = input.value.trim();
             });
-            localStorage.setItem(STORE_KEY_CONFIG, JSON.stringify(appConfig));
+            safeSaveLocalConfig(appConfig);
             renderDashboard();
 
             if(window.isCloudActive) {
